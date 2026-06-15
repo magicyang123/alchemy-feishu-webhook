@@ -55,12 +55,12 @@ function extractStableCoinAmount(activities) {
     return totalAmount;
 }
 
-console.log('=== 飞书推送2.1（去重版） ===');
+console.log('=== 飞书推送2.2（event链接修复） ===');
 console.log('飞书Webhook:', FEISHU_WEBHOOK ? '✅ 已配置' : '❌ 未配置');
 console.log('监控地址:', MONITORED_ADDRESSES.length > 0 ? MONITORED_ADDRESSES : '⚠️ 未配置');
 console.log('端口:', PORT);
 console.log('去重窗口:', DEDUP_WINDOW_MS / 1000 / 60, '分钟');
-console.log('================================');
+console.log('====================================');
 
 async function sendToFeishu(message) {
     if (!FEISHU_WEBHOOK) return;
@@ -115,6 +115,54 @@ function hexToDecimal(hexString) {
     }
 }
 
+/**
+ * 从 market slug 中提取 event slug（去掉 game 后缀）
+ * 例如: "cs2-prv-9z-2026-06-11-game2" -> "cs2-prv-9z-2026-06-11"
+ *       "btc-updown-5m-1781200800" -> "btc-updown-5m-1781200800" (无变化)
+ */
+function extractEventSlug(marketSlug) {
+    if (!marketSlug) return null;
+    // 匹配 -game 或 -map 等后缀（不区分大小写）
+    const patterns = [
+        /-game\d+$/i,      // -game1, -game2, -game3
+        /-map\d+$/i,       // -map1, -map2, -map3
+        /-leg\d+$/i,       // -leg1, -leg2
+        /-set\d+$/i        // -set1, -set2
+    ];
+    
+    let eventSlug = marketSlug;
+    for (const pattern of patterns) {
+        if (pattern.test(eventSlug)) {
+            eventSlug = eventSlug.replace(pattern, '');
+            break;
+        }
+    }
+    return eventSlug;
+}
+
+/**
+ * 获取正确的 event slug（通过 API 查询父事件）
+ */
+async function getEventSlugFromAPI(marketSlug) {
+    if (!marketSlug) return null;
+    
+    try {
+        // 尝试获取父事件信息
+        const url = `https://gamma-api.polymarket.com/events?slug=${marketSlug}`;
+        const response = await axios.get(url, { timeout: 5000 });
+        
+        if (response.data && response.data.length > 0 && response.data[0].slug) {
+            return response.data[0].slug;
+        }
+    } catch (error) {
+        // API 调用失败，使用本地规则
+        console.log(`⚠️ 无法通过 API 获取 event slug: ${marketSlug}`);
+    }
+    
+    // 降级：使用本地规则
+    return extractEventSlug(marketSlug);
+}
+
 async function getMarketInfo(tokenId) {
     if (!tokenId) return null;
     let decimalTokenId = tokenId;
@@ -159,9 +207,15 @@ async function getMarketInfo(tokenId) {
                         } else if (Array.isArray(od)) outcomes = od;
                     }
                     clobTokenIds = clobTokenIds.map(id => String(id).trim());
+                    
+                    // 获取正确的 event slug（用于链接）
+                    const marketSlug = market.slug;
+                    const eventSlug = await getEventSlugFromAPI(marketSlug);
+                    
                     return {
                         question: market.question || market.title,
                         slug: market.slug,
+                        eventSlug: eventSlug || extractEventSlug(marketSlug), // 优先使用 API 返回的 event slug
                         endDate: market.endDate,
                         clobTokenIds,
                         outcomes
@@ -269,6 +323,7 @@ async function processTransaction(hash, activities) {
                     outcome,
                     marketQuestion: marketInfo?.question,
                     marketSlug: marketInfo?.slug,
+                    eventSlug: marketInfo?.eventSlug,  // 使用正确的 event slug
                     sharesDisplay,
                     avgPriceDisplay
                 });
@@ -278,9 +333,9 @@ async function processTransaction(hash, activities) {
 
     if (items.length === 0) return null;
 
-    // 去重检查：使用 marketSlug 作为去重键
+    // 去重检查
     const firstItem = items[0];
-    const dedupKey = firstItem.marketSlug;
+    const dedupKey = firstItem.eventSlug || firstItem.marketSlug;
     
     if (dedupKey) {
         const lastPushTime = lastPushCache.get(dedupKey);
@@ -289,20 +344,25 @@ async function processTransaction(hash, activities) {
         if (lastPushTime && (now - lastPushTime) < DEDUP_WINDOW_MS) {
             const remainingMinutes = Math.ceil((DEDUP_WINDOW_MS - (now - lastPushTime)) / 1000 / 60);
             console.log(`⏭️ 跳过重复推送: ${dedupKey}, 剩余冷却时间 ${remainingMinutes} 分钟`);
-            return null;  // 去重命中，不推送
+            return null;
         }
         
-        // 记录本次推送时间
         lastPushCache.set(dedupKey, now);
         console.log(`📝 记录推送: ${dedupKey}, 下次推送需等待 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟`);
     }
 
-    // 构建消息
+    // 构建消息 - 使用正确的 event slug 生成链接
     const detailsText = items.map(item => {
         let lines = [];
         if (item.marketQuestion) {
             lines.push(`   市场: ${item.marketQuestion}`);
-            if (item.marketSlug) lines.push(`   链接: https://polymarket.com/event/${item.marketSlug}`);
+            // 使用 eventSlug 生成正确的链接（可访问的父事件页面）
+            const linkSlug = item.eventSlug || item.marketSlug;
+            lines.push(`   链接: https://polymarket.com/event/${linkSlug}`);
+            // 可选：显示原始 market slug 用于调试
+            if (item.marketSlug && item.marketSlug !== item.eventSlug) {
+                console.log(`📎 链接转换: ${item.marketSlug} -> ${item.eventSlug}`);
+            }
         }
         lines.push(`   ${tradeType} 【${item.outcome}】`);
         lines.push(`   份额: ${item.sharesDisplay}`);
@@ -353,12 +413,19 @@ app.post('/webhook', async (req, res) => {
 app.get('/health', (req, res) => res.send('OK'));
 
 app.get('/test', async (req, res) => {
-    const testMessage = '【测试】飞书推送2.1（去重版）运行正常 ✅\n\n去重窗口: ' + (DEDUP_WINDOW_MS / 1000 / 60) + ' 分钟';
+    const testMessage = '【测试】飞书推送2.2（event链接修复）运行正常 ✅\n\n' +
+        '- 自动修复包含 game/map 后缀的市场链接\n' +
+        '- 去重窗口: ' + (DEDUP_WINDOW_MS / 1000 / 60) + ' 分钟';
     await sendToFeishu(testMessage);
-    res.json({ status: 'ok', version: '2.1 (去重版)', dedupWindowMinutes: DEDUP_WINDOW_MS / 1000 / 60 });
+    res.json({ 
+        status: 'ok', 
+        version: '2.2 (event链接修复)', 
+        dedupWindowMinutes: DEDUP_WINDOW_MS / 1000 / 60 
+    });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 飞书推送2.1（去重版）已启动！端口: ${PORT}`);
-    console.log(`✅ 同一市场在 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟内重复推送将被忽略`);
+    console.log(`\n🚀 飞书推送2.2（event链接修复）已启动！端口: ${PORT}`);
+    console.log(`✅ 自动修复包含 game/map 后缀的市场链接`);
+    console.log(`✅ 同一事件在 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟内重复推送将被忽略`);
 });
