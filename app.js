@@ -9,6 +9,22 @@ const FEISHU_WEBHOOK = process.env.FEISHU_WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 const MONITORED_ADDRESSES = (process.env.MONITORED_ADDRESSES || '').split(',').filter(addr => addr.trim());
 
+// 去重配置：同一市场在 dedupWindowMs 毫秒内重复推送将被忽略（默认30分钟）
+const DEDUP_WINDOW_MS = parseInt(process.env.DEDUP_WINDOW_MS) || 30 * 60 * 1000;
+
+// 去重缓存：记录每个 marketSlug 的最后推送时间
+const lastPushCache = new Map();
+
+// 清理过期缓存（每小时执行一次）
+setInterval(() => {
+    const now = Date.now();
+    for (const [slug, timestamp] of lastPushCache.entries()) {
+        if (now - timestamp > DEDUP_WINDOW_MS) {
+            lastPushCache.delete(slug);
+        }
+    }
+}, 60 * 60 * 1000);
+
 // 稳定币识别配置
 const STABLE_COIN_SYMBOLS = ['PUSD', 'USDC.E', 'USDC', 'USD COIN'];
 const STABLE_COIN_ADDRESSES = [
@@ -39,10 +55,11 @@ function extractStableCoinAmount(activities) {
     return totalAmount;
 }
 
-console.log('=== 飞书推送2.1（api信息版） ===');
+console.log('=== 飞书推送2.1（去重版） ===');
 console.log('飞书Webhook:', FEISHU_WEBHOOK ? '✅ 已配置' : '❌ 未配置');
 console.log('监控地址:', MONITORED_ADDRESSES.length > 0 ? MONITORED_ADDRESSES : '⚠️ 未配置');
 console.log('端口:', PORT);
+console.log('去重窗口:', DEDUP_WINDOW_MS / 1000 / 60, '分钟');
 console.log('================================');
 
 async function sendToFeishu(message) {
@@ -60,7 +77,7 @@ async function sendToFeishu(message) {
     }
 }
 
-// 通用金额格式化（用于显示金额数值）
+// 通用金额格式化
 function formatAmountNumber(value, decimals = 6, isRaw = false) {
     if (value === undefined || value === null) return NaN;
     let numValue;
@@ -98,7 +115,7 @@ function hexToDecimal(hexString) {
     }
 }
 
-async function getMarketInfoWithRawResponse(tokenId) {
+async function getMarketInfo(tokenId) {
     if (!tokenId) return null;
     let decimalTokenId = tokenId;
     if (typeof tokenId === 'string' && tokenId.startsWith('0x')) {
@@ -115,7 +132,6 @@ async function getMarketInfoWithRawResponse(tokenId) {
             const response = await axios.get(url, { timeout: 5000 });
             if (response.data) {
                 let market = null;
-                const rawResponse = response.data;
                 if (response.data.length > 0) market = response.data[0];
                 else if (response.data.markets && response.data.markets.length > 0) market = response.data.markets[0];
                 else if (response.data.question) market = response.data;
@@ -148,11 +164,8 @@ async function getMarketInfoWithRawResponse(tokenId) {
                         slug: market.slug,
                         endDate: market.endDate,
                         clobTokenIds,
-                        outcomes,
-                        rawApiResponse: rawResponse  // 保存原始响应
+                        outcomes
                     };
-                } else {
-                    return { rawApiResponse: response.data };
                 }
             }
         } catch (error) {}
@@ -235,7 +248,6 @@ async function processTransaction(hash, activities) {
     const formattedAmount = totalAmountNum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '$';
 
     const items = [];
-    let apiRawResponse = null;  // 保存 API 原始响应
 
     for (const tx of activities) {
         if (tx.erc1155Metadata && tx.erc1155Metadata.length > 0) {
@@ -243,13 +255,7 @@ async function processTransaction(hash, activities) {
                 const tokenId = item.tokenId;
                 let rawValue = item.value;
                 if (typeof rawValue === 'string' && rawValue.startsWith('0x')) rawValue = parseInt(rawValue, 16);
-                const marketInfo = await getMarketInfoWithRawResponse(tokenId);
-                
-                // 保存 API 原始响应（取第一个有效的）
-                if (marketInfo && marketInfo.rawApiResponse && !apiRawResponse) {
-                    apiRawResponse = marketInfo.rawApiResponse;
-                }
-                
+                const marketInfo = await getMarketInfo(tokenId);
                 const outcome = getOutcomeFromMarketInfo(tokenId, marketInfo).outcome || '未知';
                 const sharesNum = formatAmountNumber(rawValue, 6, true);
                 const sharesDisplay = sharesNum.toLocaleString(undefined, { minimumFractionDigits: 0, maximumFractionDigits: 4 }) + ' shares';
@@ -272,7 +278,26 @@ async function processTransaction(hash, activities) {
 
     if (items.length === 0) return null;
 
-    // 构建主消息
+    // 去重检查：使用 marketSlug 作为去重键
+    const firstItem = items[0];
+    const dedupKey = firstItem.marketSlug;
+    
+    if (dedupKey) {
+        const lastPushTime = lastPushCache.get(dedupKey);
+        const now = Date.now();
+        
+        if (lastPushTime && (now - lastPushTime) < DEDUP_WINDOW_MS) {
+            const remainingMinutes = Math.ceil((DEDUP_WINDOW_MS - (now - lastPushTime)) / 1000 / 60);
+            console.log(`⏭️ 跳过重复推送: ${dedupKey}, 剩余冷却时间 ${remainingMinutes} 分钟`);
+            return null;  // 去重命中，不推送
+        }
+        
+        // 记录本次推送时间
+        lastPushCache.set(dedupKey, now);
+        console.log(`📝 记录推送: ${dedupKey}, 下次推送需等待 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟`);
+    }
+
+    // 构建消息
     const detailsText = items.map(item => {
         let lines = [];
         if (item.marketQuestion) {
@@ -286,24 +311,11 @@ async function processTransaction(hash, activities) {
         return lines.join('\n');
     }).join('\n\n');
 
-    let readableMessage = `【跟单信息】\n` +
+    const readableMessage = `【跟单信息】\n` +
         `📋 交易类型: ${tradeType}\n` +
         `📦 交易详情:\n${detailsText}\n` +
         `🕐 时间: ${timeStr}\n` +
         `🔗 浏览器: https://polygonscan.com/tx/${hash}`;
-
-    // 附加 API 原始响应信息
-    if (apiRawResponse) {
-        const apiInfo = `\n\n📡 API查询原始返回数据:\n${JSON.stringify(apiRawResponse, null, 2)}`;
-        // 检查消息长度，避免超过飞书限制
-        if ((readableMessage + apiInfo).length <= 4000) {
-            readableMessage += apiInfo;
-        } else {
-            // 如果超长，截断 API 数据
-            const truncatedApi = JSON.stringify(apiRawResponse, null, 2).substring(0, 2000);
-            readableMessage += `\n\n📡 API查询原始返回数据(截断):\n${truncatedApi}\n... (数据过长已截断)`;
-        }
-    }
 
     return readableMessage;
 }
@@ -341,12 +353,12 @@ app.post('/webhook', async (req, res) => {
 app.get('/health', (req, res) => res.send('OK'));
 
 app.get('/test', async (req, res) => {
-    const testMessage = '【测试】飞书推送2.1 运行正常 ✅\n\n本版本在美化消息基础上增加了 API 查询原始返回数据。';
+    const testMessage = '【测试】飞书推送2.1（去重版）运行正常 ✅\n\n去重窗口: ' + (DEDUP_WINDOW_MS / 1000 / 60) + ' 分钟';
     await sendToFeishu(testMessage);
-    res.json({ status: 'ok', version: '2.1 (api信息版)' });
+    res.json({ status: 'ok', version: '2.1 (去重版)', dedupWindowMinutes: DEDUP_WINDOW_MS / 1000 / 60 });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 飞书推送2.1（api信息版）已启动！端口: ${PORT}`);
-    console.log(`✅ 在精简版基础上附加 API 查询原始返回数据`);
+    console.log(`\n🚀 飞书推送2.1（去重版）已启动！端口: ${PORT}`);
+    console.log(`✅ 同一市场在 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟内重复推送将被忽略`);
 });
