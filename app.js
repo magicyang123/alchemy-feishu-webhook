@@ -362,10 +362,14 @@ async function processTransaction(hash, activities) {
         let lines = [];
         if (item.marketQuestion) {
             lines.push(`   市场: ${item.marketQuestion}`);
-            // 使用 eventSlug 生成正确的链接（可访问的父事件页面）
-            const linkSlug = item.eventSlug || item.marketSlug;
-            lines.push(`   链接: https://polymarket.com/event/${linkSlug}`);
-            // 可选：显示原始 market slug 用于调试
+            // +++ PM链接（原链接改名） +++
+            const pmLinkSlug = item.eventSlug || item.marketSlug;
+            lines.push(`   PM链接: https://polymarket.com/event/${pmLinkSlug}`);
+            // +++ 新增 BetMoar 链接 +++
+            if (item.marketSlug) {
+                lines.push(`   BetMoar: https://www.betmoar.fun/market/${item.marketSlug}`);
+            }
+            // +++ 新增结束 +++
             if (item.marketSlug && item.marketSlug !== item.eventSlug) {
                 console.log(`📎 链接转换: ${item.marketSlug} -> ${item.eventSlug}`);
             }
