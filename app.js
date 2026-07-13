@@ -384,8 +384,7 @@ async function processTransaction(hash, activities) {
     const readableMessage = `【跟单信息】\n` +
         `📋 交易类型: ${tradeType}\n` +
         `📦 交易详情:\n${detailsText}\n` +
-        `🕐 时间: ${timeStr}\n` +
-        `🔗 浏览器: https://polygonscan.com/tx/${hash}`;
+        `🕐 时间: ${timeStr}\n`;
 
     return readableMessage;
 }
