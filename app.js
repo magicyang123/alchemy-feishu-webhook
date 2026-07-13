@@ -297,6 +297,12 @@ async function processTransaction(hash, activities) {
     if (!isMonitored && MONITORED_ADDRESSES.length > 0) return null;
 
     const tradeType = analyzeTradeType(activities, monitoredAddress).type;
+      
+     if (tradeType !== '买入') {
+        console.log(`⏭️ 跳过非买入交易: ${hash.substring(0, 16)}..., 类型: ${tradeType}`);
+        return null;
+    }
+
     const totalStableAmount = extractStableCoinAmount(activities);
     const totalAmountNum = totalStableAmount;
     const formattedAmount = totalAmountNum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '$';
