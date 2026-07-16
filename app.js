@@ -15,12 +15,22 @@ const DEDUP_WINDOW_MS = parseInt(process.env.DEDUP_WINDOW_MS) || 30 * 60 * 1000;
 // 去重缓存：记录每个 marketSlug 的最后推送时间
 const lastPushCache = new Map();
 
+// API响应缓存
+const apiResponsesCache = new Map();
+
 // 清理过期缓存（每小时执行一次）
 setInterval(() => {
     const now = Date.now();
     for (const [slug, timestamp] of lastPushCache.entries()) {
         if (now - timestamp > DEDUP_WINDOW_MS) {
             lastPushCache.delete(slug);
+        }
+    }
+    // 清理API缓存（保留最近1小时的）
+    const oneHourAgo = now - 60 * 60 * 1000;
+    for (const [key, data] of apiResponsesCache.entries()) {
+        if (data.timestamp && data.timestamp < oneHourAgo) {
+            apiResponsesCache.delete(key);
         }
     }
 }, 60 * 60 * 1000);
@@ -55,7 +65,7 @@ function extractStableCoinAmount(activities) {
     return totalAmount;
 }
 
-console.log('=== 飞书推送2.2（event链接修复） ===');
+console.log('=== 飞书推送2.3（API原始数据） ===');
 console.log('飞书Webhook:', FEISHU_WEBHOOK ? '✅ 已配置' : '❌ 未配置');
 console.log('监控地址:', MONITORED_ADDRESSES.length > 0 ? MONITORED_ADDRESSES : '⚠️ 未配置');
 console.log('端口:', PORT);
@@ -170,19 +180,30 @@ async function getMarketInfo(tokenId) {
         decimalTokenId = hexToDecimal(tokenId);
         if (!decimalTokenId) return null;
     }
+    
     const apis = [
         `https://gamma-api.polymarket.com/markets?clob_token_ids=${decimalTokenId}`,
         `https://gamma-api.polymarket.com/markets/token-id/${decimalTokenId}`,
         `https://data-api.polymarket.com/markets?token_id=${decimalTokenId}`
     ];
+    
     for (const url of apis) {
         try {
             const response = await axios.get(url, { timeout: 5000 });
             if (response.data) {
+                // 保存原始API响应到缓存
+                const cacheKey = `api_${decimalTokenId}`;
+                apiResponsesCache.set(cacheKey, {
+                    data: response.data,
+                    timestamp: Date.now(),
+                    url: url
+                });
+                
                 let market = null;
                 if (response.data.length > 0) market = response.data[0];
                 else if (response.data.markets && response.data.markets.length > 0) market = response.data.markets[0];
                 else if (response.data.question) market = response.data;
+                
                 if (market) {
                     let clobTokenIds = [];
                     if (market.clobTokenIds) {
@@ -195,6 +216,7 @@ async function getMarketInfo(tokenId) {
                             try { clobTokenIds = JSON.parse(raw); } catch(e) { clobTokenIds = []; }
                         } else if (Array.isArray(raw)) clobTokenIds = raw;
                     }
+                    
                     let outcomes = [];
                     if (market.outcomes) {
                         if (typeof market.outcomes === 'string') {
@@ -206,6 +228,7 @@ async function getMarketInfo(tokenId) {
                             try { outcomes = JSON.parse(od); } catch(e) { outcomes = od.split(','); }
                         } else if (Array.isArray(od)) outcomes = od;
                     }
+                    
                     clobTokenIds = clobTokenIds.map(id => String(id).trim());
                     
                     // 获取正确的 event slug（用于链接）
@@ -215,10 +238,11 @@ async function getMarketInfo(tokenId) {
                     return {
                         question: market.question || market.title,
                         slug: market.slug,
-                        eventSlug: eventSlug || extractEventSlug(marketSlug), // 优先使用 API 返回的 event slug
+                        eventSlug: eventSlug || extractEventSlug(marketSlug),
                         endDate: market.endDate,
                         clobTokenIds,
-                        outcomes
+                        outcomes,
+                        rawApiResponse: response.data // 添加原始响应
                     };
                 }
             }
@@ -274,7 +298,55 @@ function analyzeTradeType(activities, monitoredAddress) {
     return { type };
 }
 
-async function processTransaction(hash, activities) {
+// 格式化API响应数据为可读文本
+function formatApiResponse(apiData) {
+    try {
+        // 提取关键信息
+        let summary = '';
+        const data = apiData.data;
+        
+        if (Array.isArray(data) && data.length > 0) {
+            const item = data[0];
+            summary = `Question: ${item.question || 'N/A'}\n`;
+            summary += `Slug: ${item.slug || 'N/A'}\n`;
+            summary += `End Date: ${item.endDate || 'N/A'}\n`;
+            if (item.outcomes) {
+                summary += `Outcomes: ${Array.isArray(item.outcomes) ? item.outcomes.join(', ') : item.outcomes}\n`;
+            }
+            if (item.clobTokenIds) {
+                summary += `CLOB Token IDs: ${Array.isArray(item.clobTokenIds) ? item.clobTokenIds.join(', ') : item.clobTokenIds}\n`;
+            }
+        } else if (data.markets && data.markets.length > 0) {
+            const item = data.markets[0];
+            summary = `Question: ${item.question || 'N/A'}\n`;
+            summary += `Slug: ${item.slug || 'N/A'}\n`;
+            summary += `End Date: ${item.endDate || 'N/A'}\n`;
+            if (item.outcomes) {
+                summary += `Outcomes: ${Array.isArray(item.outcomes) ? item.outcomes.join(', ') : item.outcomes}\n`;
+            }
+        } else if (data.question) {
+            summary = `Question: ${data.question || 'N/A'}\n`;
+            summary += `Slug: ${data.slug || 'N/A'}\n`;
+            summary += `End Date: ${data.endDate || 'N/A'}\n`;
+            if (data.outcomes) {
+                summary += `Outcomes: ${Array.isArray(data.outcomes) ? data.outcomes.join(', ') : data.outcomes}\n`;
+            }
+        } else {
+            // 如果没有找到关键信息，返回完整的JSON（但限制长度）
+            let fullJson = JSON.stringify(data, null, 2);
+            if (fullJson.length > 500) {
+                fullJson = fullJson.substring(0, 500) + '\n... (截断)';
+            }
+            summary = `完整响应:\n${fullJson}`;
+        }
+        
+        return summary;
+    } catch (error) {
+        return `格式化失败: ${error.message}`;
+    }
+}
+
+async function processTransaction(hash, activities, rawEventData) {
     if (!activities || activities.length === 0) return null;
     const firstTx = activities[0];
     const timestamp = firstTx.blockTimestamp ? parseInt(firstTx.blockTimestamp, 16) * 1000 : Date.now();
@@ -298,7 +370,7 @@ async function processTransaction(hash, activities) {
 
     const tradeType = analyzeTradeType(activities, monitoredAddress).type;
       
-     if (tradeType !== '买入') {
+    if (tradeType !== '买入') {
         console.log(`⏭️ 跳过非买入交易: ${hash.substring(0, 16)}..., 类型: ${tradeType}`);
         return null;
     }
@@ -308,6 +380,7 @@ async function processTransaction(hash, activities) {
     const formattedAmount = totalAmountNum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + '$';
 
     const items = [];
+    const apiResponses = [];
 
     for (const tx of activities) {
         if (tx.erc1155Metadata && tx.erc1155Metadata.length > 0) {
@@ -325,13 +398,26 @@ async function processTransaction(hash, activities) {
                     const avgInCents = avgInDollar * 100;
                     avgPriceDisplay = avgInCents.toFixed(1) + '¢';
                 }
+                
+                // 收集API响应数据
+                if (marketInfo && marketInfo.rawApiResponse) {
+                    const cacheKey = `api_${tokenId}`;
+                    const cachedData = apiResponsesCache.get(cacheKey);
+                    apiResponses.push({
+                        tokenId: tokenId,
+                        response: marketInfo.rawApiResponse,
+                        url: cachedData ? cachedData.url : 'unknown'
+                    });
+                }
+                
                 items.push({
                     outcome,
                     marketQuestion: marketInfo?.question,
                     marketSlug: marketInfo?.slug,
-                    eventSlug: marketInfo?.eventSlug,  // 使用正确的 event slug
+                    eventSlug: marketInfo?.eventSlug,
                     sharesDisplay,
-                    avgPriceDisplay
+                    avgPriceDisplay,
+                    tokenId: tokenId
                 });
             }
         }
@@ -357,19 +443,16 @@ async function processTransaction(hash, activities) {
         console.log(`📝 记录推送: ${dedupKey}, 下次推送需等待 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟`);
     }
 
-    // 构建消息 - 使用正确的 event slug 生成链接
+    // 构建消息
     const detailsText = items.map(item => {
         let lines = [];
         if (item.marketQuestion) {
             lines.push(`   市场: ${item.marketQuestion}`);
-            // +++ PM链接（原链接改名） +++
             const pmLinkSlug = item.eventSlug || item.marketSlug;
             lines.push(`   PM链接: https://polymarket.com/event/${pmLinkSlug}`);
-            // +++ 新增 BetMoar 链接 +++
             if (item.marketSlug) {
                 lines.push(`   BetMoar: https://www.betmoar.fun/market/${item.marketSlug}`);
             }
-            // +++ 新增结束 +++
             if (item.marketSlug && item.marketSlug !== item.eventSlug) {
                 console.log(`📎 链接转换: ${item.marketSlug} -> ${item.eventSlug}`);
             }
@@ -381,10 +464,35 @@ async function processTransaction(hash, activities) {
         return lines.join('\n');
     }).join('\n\n');
 
-    const readableMessage = `【跟单信息】\n` +
+    let readableMessage = `【跟单信息】\n` +
         `📋 交易类型: ${tradeType}\n` +
         `📦 交易详情:\n${detailsText}\n` +
         `🕐 时间: ${timeStr}\n`;
+
+    // 添加API原始响应数据
+    if (apiResponses.length > 0) {
+        readableMessage += `\n\n📄 API原始响应数据:\n`;
+        let responseCount = 0;
+        for (const apiData of apiResponses) {
+            responseCount++;
+            if (responseCount > 3) {
+                readableMessage += `\n... 还有 ${apiResponses.length - 3} 个API响应未显示 (消息过长)\n`;
+                break;
+            }
+            
+            readableMessage += `\n--- API响应 #${responseCount} (Token: ${apiData.tokenId}) ---\n`;
+            readableMessage += `URL: ${apiData.url}\n`;
+            
+            const formattedSummary = formatApiResponse({ data: apiData.response });
+            // 限制每个API响应的显示长度
+            let summaryLines = formattedSummary.split('\n');
+            if (summaryLines.length > 10) {
+                summaryLines = summaryLines.slice(0, 10);
+                summaryLines.push('... (响应内容过长已截断)');
+            }
+            readableMessage += summaryLines.join('\n') + '\n';
+        }
+    }
 
     return readableMessage;
 }
@@ -399,18 +507,28 @@ app.post('/webhook', async (req, res) => {
         const event = req.body.event;
         if (!event?.activity) return;
         console.log(`📊 收到 ${event.activity.length} 条 activity`);
+        
+        // 保存原始事件数据
+        const rawEventData = req.body;
+        
         for (const tx of event.activity) {
             const hash = tx.hash;
-            if (!pendingTransactions.has(hash)) pendingTransactions.set(hash, []);
-            pendingTransactions.get(hash).push(tx);
+            if (!pendingTransactions.has(hash)) {
+                pendingTransactions.set(hash, { 
+                    activities: [], 
+                    rawData: rawEventData 
+                });
+            }
+            pendingTransactions.get(hash).activities.push(tx);
         }
+        
         if (processingTimer) clearTimeout(processingTimer);
         processingTimer = setTimeout(async () => {
             const transactions = new Map(pendingTransactions);
             pendingTransactions.clear();
-            for (const [hash, activities] of transactions) {
-                console.log(`🔄 处理交易: ${hash.substring(0, 16)}..., ${activities.length} 条 activity`);
-                const message = await processTransaction(hash, activities);
+            for (const [hash, data] of transactions) {
+                console.log(`🔄 处理交易: ${hash.substring(0, 16)}..., ${data.activities.length} 条 activity`);
+                const message = await processTransaction(hash, data.activities, data.rawData);
                 if (message) await sendToFeishu(message);
             }
         }, 2000);
@@ -422,19 +540,21 @@ app.post('/webhook', async (req, res) => {
 app.get('/health', (req, res) => res.send('OK'));
 
 app.get('/test', async (req, res) => {
-    const testMessage = '【测试】飞书推送2.2（event链接修复）运行正常 ✅\n\n' +
+    const testMessage = '【测试】飞书推送2.3（API原始数据）运行正常 ✅\n\n' +
         '- 自动修复包含 game/map 后缀的市场链接\n' +
-        '- 去重窗口: ' + (DEDUP_WINDOW_MS / 1000 / 60) + ' 分钟';
+        '- 去重窗口: ' + (DEDUP_WINDOW_MS / 1000 / 60) + ' 分钟\n' +
+        '- 显示API原始响应数据';
     await sendToFeishu(testMessage);
     res.json({ 
         status: 'ok', 
-        version: '2.2 (event链接修复)', 
+        version: '2.3 (API原始数据)', 
         dedupWindowMinutes: DEDUP_WINDOW_MS / 1000 / 60 
     });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 飞书推送2.2（event链接修复）已启动！端口: ${PORT}`);
+    console.log(`\n🚀 飞书推送2.3（API原始数据）已启动！端口: ${PORT}`);
     console.log(`✅ 自动修复包含 game/map 后缀的市场链接`);
     console.log(`✅ 同一事件在 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟内重复推送将被忽略`);
+    console.log(`✅ 推送消息中包含API原始响应数据`);
 });
