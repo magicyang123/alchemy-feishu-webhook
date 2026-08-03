@@ -65,7 +65,7 @@ function extractStableCoinAmount(activities) {
     return totalAmount;
 }
 
-console.log('=== 飞书推送2.3（API原始数据） ===');
+console.log('=== 飞书推送2.4 ===');
 console.log('飞书Webhook:', FEISHU_WEBHOOK ? '✅ 已配置' : '❌ 未配置');
 console.log('监控地址:', MONITORED_ADDRESSES.length > 0 ? MONITORED_ADDRESSES : '⚠️ 未配置');
 console.log('端口:', PORT);
@@ -449,7 +449,7 @@ async function processTransaction(hash, activities, rawEventData) {
         if (item.marketQuestion) {
             lines.push(`   市场: ${item.marketQuestion}`);
             const pmLinkSlug = item.eventSlug || item.marketSlug;
-            lines.push(`   PM链接: https://polymarket.com/event/${pmLinkSlug}`);
+            //删除 lines.push(`   PM链接: https://polymarket.com/event/${pmLinkSlug}`);
             if (item.marketSlug) {
                 lines.push(`   BetMoar: https://www.betmoar.fun/market/${item.marketSlug}`);
             }
@@ -469,32 +469,7 @@ async function processTransaction(hash, activities, rawEventData) {
         `📦 交易详情:\n${detailsText}\n` +
         `🕐 时间: ${timeStr}\n`;
 
-    // 添加API原始响应数据
-    if (apiResponses.length > 0) {
-        readableMessage += `\n\n📄 API原始响应数据:\n`;
-        let responseCount = 0;
-        for (const apiData of apiResponses) {
-            responseCount++;
-            if (responseCount > 3) {
-                readableMessage += `\n... 还有 ${apiResponses.length - 3} 个API响应未显示 (消息过长)\n`;
-                break;
-            }
-            
-            readableMessage += `\n--- API响应 #${responseCount} (Token: ${apiData.tokenId}) ---\n`;
-            readableMessage += `URL: ${apiData.url}\n`;
-            
-            const formattedSummary = formatApiResponse({ data: apiData.response });
-            // 限制每个API响应的显示长度
-            let summaryLines = formattedSummary.split('\n');
-            if (summaryLines.length > 10) {
-                summaryLines = summaryLines.slice(0, 10);
-                summaryLines.push('... (响应内容过长已截断)');
-            }
-            readableMessage += summaryLines.join('\n') + '\n';
-        }
-    }
-
-    return readableMessage;
+        return readableMessage;
 }
 
 let pendingTransactions = new Map();
@@ -553,7 +528,7 @@ app.get('/test', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 飞书推送2.3（API原始数据）已启动！端口: ${PORT}`);
+    console.log(`\n🚀 飞书推送2.4已启动！端口: ${PORT}`);
     console.log(`✅ 自动修复包含 game/map 后缀的市场链接`);
     console.log(`✅ 同一事件在 ${DEDUP_WINDOW_MS / 1000 / 60} 分钟内重复推送将被忽略`);
     console.log(`✅ 推送消息中包含API原始响应数据`);
